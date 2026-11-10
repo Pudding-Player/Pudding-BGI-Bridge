@@ -1,0 +1,2 @@
+plugins/*/bridge/generated/*.hpp text eol=lf
+*.cmd text eol=crlf

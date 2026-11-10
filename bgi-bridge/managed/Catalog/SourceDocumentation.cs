@@ -1,0 +1,79 @@
+using System.Text.Json;
+
+namespace BgiBridge.Catalog;
+
+public sealed record SourceEntry(string Summary, string? Label, string Kind, string? ValueType,
+    string? Initial, string[]? Range, string Source, int Line, bool HasCustomChangeHook, bool HasImplementation = true,
+    string DocumentationSource = "host-source", bool NeedsDialogInput = false, bool UsesSelection = false, bool AsyncVoid = false,
+    bool HasAwait = true, string[]? DialogTitles = null, bool IsObsolete = false, string? ExposureReason = null, string Interaction = "direct");
+
+public static class SourceDocumentation
+{
+    public static JsonElement ScriptBindings => Data.TryGetProperty("scriptBindings", out var bindings) ? bindings : ArgumentSchema.Parse("[]");
+    public static JsonElement ScriptTypes => Data.TryGetProperty("scriptTypes", out var types) ? types : ArgumentSchema.Parse("{}");
+    private static readonly JsonElement Data = Load();
+    private static readonly JsonSerializerOptions Options = new() { PropertyNameCaseInsensitive = true };
+    private static readonly Dictionary<string, SourceEntry> Entries = Data.TryGetProperty("entries", out var entries)
+        ? entries.Deserialize<Dictionary<string, SourceEntry>>(Options) ?? [] : [];
+    public static SourceEntry? Find(string prefix, Type owner, string name)
+    {
+        for (var type = owner; type is not null; type = type.BaseType)
+        {
+            var entry = Find(prefix, type.FullName!, name);
+            if (entry is null) continue;
+            // 宿主的 AutoFightConfig 会把该 DTO 复制一份给 AutoLeyLineOutcropFightConfig；同名成员共用一份说明。
+            if (entry.Summary.Length == 0 && type.FullName == "BetterGenshinImpact.GameTask.AutoLeyLineOutcrop.AutoLeyLineOutcropFightConfig+FightFinishDetectConfig"
+                && Entries.TryGetValue($"P:BetterGenshinImpact.GameTask.AutoFight.AutoFightConfig+FightFinishDetectConfig.{name}", out var shared))
+                return entry with { Summary = "地脉花战斗检查：" + shared.Summary, DocumentationSource = "host-shared-config" };
+            return entry;
+        }
+        return null;
+    }
+
+    /// <summary>按宿主类型全名查找。硬编码宿主成员名的桥代码用它核对文档里的真实成员。</summary>
+    public static SourceEntry? Find(string prefix, string ownerFullName, string name)
+    {
+        if (Entries.TryGetValue($"{prefix}:{ownerFullName}.{name}", out var entry)) return entry;
+        if (!ownerFullName.Contains('`')) return null;
+        var owner = System.Text.RegularExpressions.Regex.Replace(ownerFullName.Split('[')[0], @"`\d+", "");
+        return Entries.FirstOrDefault(pair => pair.Key.StartsWith(prefix + ":", StringComparison.Ordinal)
+            && System.Text.RegularExpressions.Regex.Replace(pair.Key, @"<[^>]+>", "") == $"{prefix}:{owner}.{name}").Value;
+    }
+
+    public static string[]? StringEnum(SourceEntry? entry)
+    {
+        if (entry?.Initial is not { } expression || !expression.EndsWith(".ToString()")) return null;
+        var type = expression.Split('.')[0];
+        return Data.TryGetProperty("enums", out var enums) && enums.TryGetProperty(type, out var values)
+            ? values.Deserialize<string[]>() : null;
+    }
+
+    public static SourceEntry? ConfigPath(string path)
+    {
+        var owner = "BetterGenshinImpact.Core.Config.AllConfig";
+        var parts = path.Split('.');
+        for (var index = 0; index < parts.Length; index++)
+        {
+            var prefix = $"P:{owner}.";
+            var entry = Entries.FirstOrDefault(pair => pair.Key.StartsWith(prefix, StringComparison.Ordinal)
+                && pair.Key[prefix.Length..].Equals(parts[index], StringComparison.OrdinalIgnoreCase)).Value;
+            if (entry is null || index == parts.Length - 1) return entry;
+            var type = entry.ValueType?.TrimEnd('?');
+            var candidates = Entries.Keys.Where(key => key.StartsWith("P:", StringComparison.Ordinal))
+                .Select(key => key[2..key.LastIndexOf('.')]).Distinct()
+                .Where(name => name.EndsWith("." + type, StringComparison.Ordinal)).ToArray();
+            if (candidates.Length != 1) return null;
+            owner = candidates[0];
+        }
+        return null;
+    }
+
+    private static JsonElement Load()
+    {
+        var assembly = typeof(SourceDocumentation).Assembly;
+        var name = assembly.GetManifestResourceNames().SingleOrDefault(n => n.EndsWith("host-documentation.json"));
+        if (name is null) return ArgumentSchema.Parse("{}");
+        using var stream = assembly.GetManifestResourceStream(name)!;
+        return JsonSerializer.Deserialize<JsonElement>(stream);
+    }
+}

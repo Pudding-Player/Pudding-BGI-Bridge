@@ -1,0 +1,78 @@
+# BgiBridge
+
+把 Pudding 的控制面注入 BetterGI 进程，让原版 BetterGI 提供 `/bridge/v1` 接口。
+
+连接不修改宿主源码；任务、资源和设置操作按各自接口契约执行。
+
+## 离线来源限制
+
+连接前只读 BetterGI 主程序中的程序集和内嵌 Portable PDB，通过覆盖实际源码文档的 SourceLink 映射确认仓库来源。允许 `babalae/better-genshin-impact`，不比较 BGI 版本号、分支、提交或程序文件哈希；正式版和测试版沿用同一算法，不实时联网认证。来源为其他仓库、缺失来源或无法解析时拒绝连接，用户提示为“连接失败，请使用官方版本的BetterGI。”。
+
+校验在启动／注入前、已有连接、BGI 工具调用和桥端均执行；本地结果按文件状态缓存。只解析主程序，不扫描用户配置、路线、JS 脚本或使用者的社区归属。SourceLink 是构建者提供的元数据，不是数字签名：伪造来源或直接使用官方二进制可以绕过，不能据此保证识别所有非官方构建，更不能判断使用者属于哪个群体。未知官方构建若不再保留可解析的来源元数据，需要适配其元数据格式，不能仅凭版本名放行。
+
+## 发布布局
+
+发布版把桥组件收在安装目录的 `bridge\` 子目录里：`bridge\` 内是 9 个 `BgiBridge.*` 文件与
+空凭据模板 `bridge.config.example.json`，主程序 `pudding.exe` 在上一级。这一整目录必须保持在一起，主程序按
+同样的相对位置查找它们。
+
+## 目录
+
+| 目录 | 内容 |
+|---|---|
+| `native/` | 注入器与引导 DLL。C++，只依赖 kernel32 |
+| `managed/` | 桥本体。C#，运行于 BetterGI 进程内，无第三方依赖 |
+| `recovery/` | 离线恢复工具，随发布一起分发 |
+| `dev/` | 开发期专用：元数据生成器、本地脚本 |
+
+## 构建
+
+```cmd
+build.cmd
+```
+
+产物输出到仓库的 `target\bridge\`，各 .NET 项目的中间目录在 `target\dotnet\` 下。
+本目录不留构建产物。通常无需单独执行，`npm run dist` 会调用本脚本。
+
+## 配置
+
+`bridge.config.json`（模板见 `bridge.config.example.json`）：
+
+| 字段 | 作用 |
+|---|---|
+| `enabled` | 总开关。关掉后注入器不注入，已注入的实例对请求回 503 |
+| `listen` | 监听地址，只允许回环 |
+| `token` | 鉴权。留空时由 Pudding 首次连接时生成并写入 |
+| `groups` | 按组开关。关掉的组不进 catalog，invoke 也拒绝 |
+| `disabledMethods` | 单方法黑名单，优先级最高 |
+| `userDirectory` | 数据根。由 Pudding 每次连接写入，指向安装目录下的 `user\`；缺失时退回桥目录下的 `user\` |
+
+## 运行期数据
+
+桥不改宿主目录，也不往安装目录里堆运行期产物：它的数据落在 Pudding 安装目录的
+`user\` 下，落点集中在 `managed/InstallPaths.cs`。
+
+| 路径 | 内容 |
+|---|---|
+| `user\log\bridge.log` | 桥在 BetterGI 进程内的日志。BetterGI 是 WPF 应用，没有控制台 |
+| `user\data\config-changes` | 宿主配置改动记录，供回滚与重装后追溯 |
+
+`user\` 保存用户运行数据：安装与原位置更新保留它，卸载会删除程序及用户数据，不提供保留选项。需要保留记录时，应在卸载前自行导出。
+改动记录无法写入时由调用方报告错误。
+
+## 开发与验证
+
+桥专项检查与索引生成器位于 `dev/`，桌面与界面检查位于 Pudding 主仓的 `tests/`。构建使用影拷贝加载的组件，不主动结束宿主进程；重新连接后核对加载版本。命令与基准更新方法见 [开发文档](https://github.com/Pudding-Player/Pudding/blob/main/docs/development.md)。
+
+## 实现约束
+
+修改前请先阅读以下四条，均为已验证必须遵守的约束：
+
+1. **入口在 `DllMain`，不在导出函数。** 宿主是启用 CFG 的 .NET 程序，
+   `CreateRemoteThread` 指向刚映射进来的模块会被 `0xC0000409/0xA` 拦下并杀掉宿主。
+   `DllMain` 由加载器调用，不受该限制。因此注入器只执行一次 `LoadLibraryW`。
+2. **释放远程参数前必须等线程结束。** `CreateRemoteThread` 只是创建线程，
+   提前 `VirtualFreeEx` 会让 `LoadLibraryW` 读到已解映射的页。
+3. **托管依赖只能用宿主 TPA 里已有的。** 嵌入的 `BetterGI.deps.json` 不可编辑，
+   桥的依赖无法加入宿主的依赖图。因此只使用 `System.Net.HttpListener` 和 `System.Text.Json`。
+4. **宿主程序集叫 `BetterGI`，不是 `BetterGenshinImpact`。** 后者是命名空间。

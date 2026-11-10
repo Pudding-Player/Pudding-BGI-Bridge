@@ -1,0 +1,20 @@
+# 构建产物统一落在仓库的 target/ 下（target/bridge 是桥组件，target/dotnet 是
+# .NET 中间目录），这里只需要挡住误落在源码目录里的东西。
+/managed/bin/
+/managed/obj/
+/obj/
+/bin/
+config-change-*.json
+*.tmp
+
+# 本地配置：含 token 和用户自己的开关，不进版本库。
+# 模板是 bridge.config.example.json。
+/bridge.config.json
+
+# 开发期的一次性靶子与探针，不属于交付内容
+/.testtarget/
+/.probe/
+
+# 运行日志（桥写在自己目录里，不碰 BetterGI）
+*.log
+build-out.txt

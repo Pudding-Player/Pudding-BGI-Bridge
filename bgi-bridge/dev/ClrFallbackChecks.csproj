@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup><BaseIntermediateOutputPath>../../target/dotnet/clr-fallback-checks-obj/</BaseIntermediateOutputPath><MSBuildProjectExtensionsPath>../../target/dotnet/clr-fallback-checks-obj/</MSBuildProjectExtensionsPath></PropertyGroup>
+  <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0-windows</TargetFramework><UseWPF>true</UseWPF><AssemblyName>BetterGI</AssemblyName><UseAppHost>false</UseAppHost><EnableDefaultCompileItems>false</EnableDefaultCompileItems><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><OutputPath>../../target/dotnet/clr-fallback-checks/</OutputPath></PropertyGroup>
+  <ItemGroup><Compile Include="ClrFallbackChecks.cs"/><ProjectReference Include="../managed/BgiBridge.csproj"/></ItemGroup>
+  <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+</Project>

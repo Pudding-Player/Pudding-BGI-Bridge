@@ -1,0 +1,16 @@
+/target/
+/dist/
+node_modules/
+**/bin/
+**/obj/
+**/bridge.config.json
+**/user/
+*.log
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+*.pem
+*.key
+*.pfx

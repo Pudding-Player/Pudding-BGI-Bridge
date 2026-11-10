@@ -1,0 +1,533 @@
+// Production-core acceptance: real file flows for SyncCore / AggregateRouteRequirements /
+// DescribeEffectiveStrategy / EffectiveFieldReport. Fixtures live under the registered
+// target/.tmp/shortcut-runtime cache via %TEMP%; no deletion here (root cleans the cache).
+using System.IO;
+using System.Text.Json.Nodes;
+using BgiBridge.Tools;
+using BgiBridge.Catalog;
+using BgiBridge.Bgi;
+using BgiBridge.Protocol;
+using System.Text.Json;
+
+static void Require(bool value, string message) { if (!value) throw new Exception(message); }
+
+if (args.Length >= 2 && args[0] is "--check-interfaces" or "--export-interfaces")
+{
+    try { RegistrySnapshot.Run(args); }
+    catch (Exception error) { Console.Error.WriteLine(error.Message); Environment.ExitCode = 1; }
+    return;
+}
+
+var cache = Environment.ExpandEnvironmentVariables("%TEMP%");
+var root = Path.Combine(cache, "production-core-fixtures");
+Directory.CreateDirectory(root);
+var id = Guid.NewGuid().ToString("N")[..8];
+var userRoot = Path.Combine(root, $"user-{id}");
+var groupDir = Path.Combine(userRoot, "ScriptGroup");
+var routeDir = Path.Combine(userRoot, "AutoPathing", "兽怪暴徒");
+Directory.CreateDirectory(groupDir);
+Directory.CreateDirectory(routeDir);
+
+var bridgeDir = Path.Combine(root, $"bridge-{id}");
+var legacyRecords = Path.Combine(bridgeDir, "user", ".pudding", "config-changes");
+Directory.CreateDirectory(legacyRecords);
+File.WriteAllText(Path.Combine(legacyRecords, "record.json"), "original recovery");
+BgiBridge.InstallPaths.Ensure(bridgeDir);
+Require(Directory.Exists(Path.Combine(bridgeDir, "user", ".pudding"))
+    && !Directory.Exists(Path.Combine(bridgeDir, "user", "data")), "preflight logging must not migrate business data");
+var migratedRecords = BgiBridge.InstallPaths.ChangeRecordDirectory(bridgeDir);
+Require(migratedRecords == Path.Combine(bridgeDir, "user", "data", "config-changes"), "visible data directory");
+Require(File.ReadAllText(Path.Combine(migratedRecords, "record.json")) == "original recovery", "recovery records survive migration");
+Require(!Directory.Exists(Path.Combine(bridgeDir, "user", ".pudding")), "legacy directory moved");
+Require(BgiBridge.InstallPaths.ChangeRecordDirectory(bridgeDir) == migratedRecords, "migration is idempotent");
+
+var lockedBridge = Path.Combine(root, $"bridge-locked-{id}");
+var lockedLegacy = Path.Combine(lockedBridge, "user", ".pudding");
+Directory.CreateDirectory(lockedLegacy);
+using (var active = new FileStream(Path.Combine(lockedLegacy, "pudding.runtime.lock"),
+    FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete))
+{
+    active.Lock(0, 1);
+    var blocked = false;
+    try { BgiBridge.InstallPaths.DataDirectory(lockedBridge); } catch (IOException) { blocked = true; }
+    Require(blocked && Directory.Exists(lockedLegacy), "active client blocks migration");
+    Require(!Directory.Exists(Path.Combine(lockedBridge, "user", "data")), "blocked migration leaves no second data directory");
+    active.Unlock(0, 1);
+}
+
+// 已迁移数据库与旧版重建的界面缓存共存，不能阻止新桥启动。
+var coexistBridge = Path.Combine(root, $"bridge-coexist-{id}");
+var coexistUser = Path.Combine(coexistBridge, "user");
+var canonical = Path.Combine(coexistUser, "data");
+var auxiliary = Path.Combine(coexistUser, ".pudding");
+Directory.CreateDirectory(Path.Combine(canonical, "config-changes"));
+Directory.CreateDirectory(Path.Combine(auxiliary, "webview2"));
+File.WriteAllText(Path.Combine(canonical, "pudding.db"), "canonical database");
+File.WriteAllText(Path.Combine(auxiliary, "webview2", "profile"), "legacy profile");
+Require(BgiBridge.InstallPaths.ChangeRecordDirectory(coexistBridge) == Path.Combine(canonical, "config-changes"), "legacy caches must not block the bridge");
+Require(File.ReadAllText(Path.Combine(canonical, "pudding.db")) == "canonical database", "canonical database remains untouched");
+Require(File.ReadAllText(Path.Combine(auxiliary, "webview2", "profile")) == "legacy profile", "old caches are preserved");
+File.Move(Path.Combine(canonical, "pudding.db"), Path.Combine(canonical, "custom.sqlite"));
+File.WriteAllText(Path.Combine(coexistUser, "config.json"), "{\"storage\":{\"database\":\"data/custom.sqlite\"}}");
+Require(BgiBridge.InstallPaths.DataDirectory(coexistBridge) == canonical, "canonical custom database follows the app configuration");
+File.WriteAllText(Path.Combine(coexistUser, "config.json"), "{\"storage\":{\"database\":\"outside.sqlite\"}}");
+File.WriteAllText(Path.Combine(coexistUser, "outside.sqlite"), "external database");
+var externalDatabaseBlocked = false;
+try { BgiBridge.InstallPaths.DataDirectory(coexistBridge); } catch (IOException) { externalDatabaseBlocked = true; }
+Require(externalDatabaseBlocked, "an unrelated database cannot authorize choosing the canonical directory");
+File.WriteAllText(Path.Combine(coexistUser, "config.json"), "{\"storage\":{\"database\":\"data/pudding.db\"}}");
+File.Move(Path.Combine(canonical, "custom.sqlite"), Path.Combine(canonical, "pudding.db"));
+File.WriteAllText(Path.Combine(auxiliary, "pudding.db"), "second database");
+var dualDatabaseBlocked = false;
+try { BgiBridge.InstallPaths.DataDirectory(coexistBridge); } catch (IOException) { dualDatabaseBlocked = true; }
+Require(dualDatabaseBlocked && File.ReadAllText(Path.Combine(auxiliary, "pudding.db")) == "second database", "two real databases remain a conflict");
+
+// 另一个进程在等待期间完成迁移，取得同一把锁后重新读取目录状态。
+var concurrentBridge = Path.Combine(root, $"bridge-concurrent-{id}");
+var concurrentUser = Path.Combine(concurrentBridge, "user");
+var concurrentLegacy = Path.Combine(concurrentUser, ".pudding");
+Directory.CreateDirectory(Path.Combine(concurrentLegacy, "config-changes"));
+File.WriteAllText(Path.Combine(concurrentLegacy, "config-changes", "record.json"), "preserved recovery");
+using (var migration = new FileStream(Path.Combine(concurrentUser, "data-migration.lock"), FileMode.OpenOrCreate,
+    FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete))
+{
+    migration.Lock(0, 1);
+    using var started = new ManualResetEventSlim();
+    var waiter = Task.Run(() => { started.Set(); return BgiBridge.InstallPaths.ChangeRecordDirectory(concurrentBridge); });
+    Require(started.Wait(TimeSpan.FromSeconds(5)), "migration waiter started");
+    Thread.Sleep(100);
+    Require(!waiter.IsCompleted, "the bridge waits for the shared migration lock");
+    Directory.Move(concurrentLegacy, Path.Combine(concurrentUser, "data"));
+    migration.Unlock(0, 1);
+    Require(waiter.GetAwaiter().GetResult() == Path.Combine(concurrentUser, "data", "config-changes"), "completed concurrent migration is idempotent");
+}
+Require(File.ReadAllText(Path.Combine(concurrentUser, "data", "config-changes", "record.json")) == "preserved recovery", "concurrent migration preserves recovery records");
+
+var configuredBridge = Path.Combine(root, $"bridge-configured-{id}");
+Directory.CreateDirectory(configuredBridge);
+var bridgeConfig = Path.Combine(configuredBridge, "bridge.config.json");
+var configuredUser = Path.Combine(root, $"用户数据-{id}");
+File.WriteAllText(bridgeConfig, System.Text.Json.JsonSerializer.Serialize(new { userDirectory = configuredUser }), new System.Text.UTF8Encoding(true));
+Require(BgiBridge.InstallPaths.UserRoot(configuredBridge) == configuredUser, "BOM and Unicode absolute roots remain supported");
+File.WriteAllText(bridgeConfig, "{\"userDirectory\":\"C:relative\"}");
+var relativeBlocked = false;
+try { BgiBridge.InstallPaths.UserRoot(configuredBridge); } catch (IOException) { relativeBlocked = true; }
+Require(relativeBlocked && !Directory.Exists(Path.Combine(configuredBridge, "user")), "drive-relative root must not silently create shadow-copy data");
+File.WriteAllText(bridgeConfig, "{");
+var malformedBlocked = false;
+try { BgiBridge.InstallPaths.UserRoot(configuredBridge); } catch (System.Text.Json.JsonException) { malformedBlocked = true; }
+Require(malformedBlocked && !Directory.Exists(Path.Combine(configuredBridge, "user")), "malformed configuration must not silently redirect user data");
+
+if (args.Contains("--data-migration"))
+{
+    Console.WriteLine("Data migration checks passed: legacy records, active locks, cache coexistence, database conflicts, concurrent migration, BOM/Unicode roots and invalid configuration.");
+    return;
+}
+
+// ---- descriptions use BetterGI while actual parameter values stay untouched ----
+var wordingRegistry = new MethodRegistry();
+var wordingSchema = System.Text.Json.JsonSerializer.SerializeToElement(new { type = "object", properties = new { value = new { type = "string", @enum = new[] { "宿主" } } } });
+var wordingExample = System.Text.Json.JsonSerializer.SerializeToElement(new { value = "宿主" });
+wordingRegistry.Register("fixture.wording", "settings", "宿主设置", (_, _) => Task.FromResult<object?>(null), inputSchema: wordingSchema,
+    guide: new AgentGuide("读取宿主设置", "查看宿主当前设置", ["修改宿主设置前"], ["宿主已连接"], [], "宿主返回当前值", "核对宿主设置", "只读", [wordingExample]));
+Require(wordingRegistry.TryGet("fixture.wording", out var wording, out _), "registered wording fixture");
+Require(wording.Guide.Title == "读取BetterGI设置" && wording.Summary == "查看BetterGI当前设置", "descriptions identify BetterGI");
+Require(wording.Guide.Preconditions[0] == "BetterGI已连接", "guide prerequisites identify BetterGI");
+Require(wording.InputSchema.GetRawText() == wordingSchema.GetRawText(), "schema values must remain exact");
+Require(wording.Guide.Examples[0].GetProperty("value").GetString() == "宿主", "example data must not be rewritten");
+var invalidExampleRejected = false;
+try
+{
+    wordingRegistry.Register("fixture.invalid-example", "settings", "invalid example", (_, _) => Task.FromResult<object?>(null), inputSchema: wordingSchema,
+        guide: wording.Guide with { Examples = [System.Text.Json.JsonSerializer.SerializeToElement(new { value = "invalid" })] });
+}
+catch (InvalidOperationException) { invalidExampleRejected = true; }
+Require(invalidExampleRejected && !wordingRegistry.TryGet("fixture.invalid-example", out _, out _), "invalid examples must not enter public registry");
+var documentedRegistry = new MethodRegistry(); StatusTools.Register(documentedRegistry); CatalogTools.Register(documentedRegistry); HostLogTools.Register(documentedRegistry);
+foreach (var method in documentedRegistry.All)
+    foreach (var example in method.Guide.Examples) ArgumentSchema.Validate(example, method.InputSchema);
+Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new { stableGuidesValidated = documentedRegistry.Count }));
+
+// ---- requirements aggregation over real route files (production path) ----
+File.WriteAllText(Path.Combine(routeDir, "01.json"), """
+{"info":{"name":"01"},"positions":[
+ {"action":"","type":"teleport","x":1,"y":2},
+ {"action":"fight","type":"path","x":3,"y":4}
+]}
+""");
+var requirements = PathingPreparationTools.AggregateRouteRequirements(userRoot, ["兽怪暴徒/01.json"]);
+var serialized = System.Text.Json.JsonSerializer.SerializeToElement(requirements);
+Require(serialized.GetProperty("battle").GetBoolean(), "fight action must aggregate as battle");
+Require(serialized.GetProperty("partyConfirmationRequired").GetBoolean(), "battle route must require party confirmation");
+Require(serialized.GetProperty("status").GetString() == "preconditionsFound", $"status: {serialized.GetProperty("status")}");
+
+File.WriteAllText(Path.Combine(routeDir, "02.json"), """
+{"positions":[{"action":"","type":"teleport"},{"action":"pick_around","type":"path"},{"action":"四叶印","type":"path"}]}
+""");
+var plain = System.Text.Json.JsonSerializer.SerializeToElement(
+    PathingPreparationTools.AggregateRouteRequirements(userRoot, ["兽怪暴徒/02.json"]));
+Require(plain.GetProperty("status").GetString() == "noPreconditions", "benign-only route must not require confirmation");
+Require(!plain.GetProperty("partyConfirmationRequired").GetBoolean(), "benign route flagged as requiring confirmation");
+
+File.WriteAllText(Path.Combine(routeDir, "03.json"), """
+{"positions":[{"action":"some_new_mechanic","type":"path"}]}
+""");
+var odd = System.Text.Json.JsonSerializer.SerializeToElement(
+    PathingPreparationTools.AggregateRouteRequirements(userRoot, ["兽怪暴徒/03.json"]));
+Require(odd.GetProperty("status").GetString() == "unknown", "unrecognized action must be unknown, not benign");
+Require(!odd.GetProperty("partyConfirmationRequired").GetBoolean() && odd.GetProperty("inspectionRequired").GetBoolean(), "unknown must request inspection instead of inventing party requirements");
+
+var missing = System.Text.Json.JsonSerializer.SerializeToElement(
+    PathingPreparationTools.AggregateRouteRequirements(userRoot, ["兽怪暴徒/不存在.json"]));
+Require(missing.GetProperty("status").GetString() == "unknown" && !missing.GetProperty("partyConfirmationRequired").GetBoolean() && missing.GetProperty("inspectionRequired").GetBoolean(),
+    "unreadable files must not be presented as no-preconditions");
+
+// ---- SyncCore: real CAS file flow ----
+var groupFile = Path.Combine(groupDir, "讨伐组.json");
+File.WriteAllText(groupFile, """
+{"name":"讨伐组","config":{"pathingConfig":{"enabled":true,"partyName":"精英","hurryOnAvatar":"玛薇卡",
+"autoFightConfig":{"strategyName":"根据队伍自动选择","pickDropsAfterFightEnabled":true,"timeout":120},
+"autoEatConfig":{"enabled":false}}},"projects":[]}
+""");
+byte[] GroupBytes() => System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(groupFile));
+string Sha() => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(GroupBytes())).ToLowerInvariant();
+var expected = Sha();
+var globalFight = JsonNode.Parse("""
+{"strategyName":"万能战斗策略（萌新推荐）","pickDropsAfterFightEnabled":false,"timeout":60,"kazuhaPickupEnabled":true}
+""")!;
+var synced = System.Text.Json.JsonSerializer.SerializeToElement(
+    PathingPreparationTools.SyncCore(userRoot, "讨伐组", expected,
+        new Dictionary<string, JsonNode?> { ["AutoFightConfig"] = globalFight.DeepClone() }));
+Require(synced.GetProperty("synced").GetBoolean() && synced.GetProperty("otherFieldsPreserved").GetBoolean(),
+    "sync must verify replaced fields and preserved tail");
+var after = JsonNode.Parse(File.ReadAllText(groupFile))!;
+Require(after["config"]!["pathingConfig"]!["autoFightConfig"]!["pickDropsAfterFightEnabled"]!.GetValue<bool>() is false,
+    "global pickDrops=false must survive into the group (effective behavior)");
+Require(after["config"]!["pathingConfig"]!["autoFightConfig"]!["strategyName"]!.GetValue<string>().Contains("万能"),
+    "global strategy name must be inherited");
+Require(after["config"]!["pathingConfig"]!["partyName"]!.GetValue<string>() == "精英", "partyName must stay untouched");
+Require(after["config"]!["pathingConfig"]!["hurryOnAvatar"]!.GetValue<string>() == "玛薇卡", "hurry avatar must stay untouched");
+// 旧 SHA 再同步：CAS 拒绝。
+var conflict = false;
+try { PathingPreparationTools.SyncCore(userRoot, "讨伐组", expected,
+    new Dictionary<string, JsonNode?> { ["AutoFightConfig"] = globalFight.DeepClone() }); }
+catch (BgiBridge.Protocol.BridgeException error) { conflict = error.Message.Contains("不一致"); }
+Require(conflict, "stale expectedSha256 must be rejected with VERSION_CONFLICT");
+
+// ---- EffectiveFieldReport: source classification over real JSON views ----
+var pathingView = after["config"]!["pathingConfig"]!.AsObject();
+var globalView = new JsonObject
+{
+    ["AutoFightConfig"] = globalFight.DeepClone(),
+    ["PartyName"] = JsonValue.Create("别队"),
+};
+var report = System.Text.Json.JsonSerializer.SerializeToElement(
+    PathingPreparationTools.EffectiveFieldReport(pathingView, globalView,
+        ["AutoFightConfig", "PartyName", "AutoEatConfig"], groupFightActive: true));
+var entries = report.EnumerateArray().ToArray();
+Require(entries[0].GetProperty("source").GetString() == "globalEqual", "synced field must read as globalEqual");
+Require(entries[0].TryGetProperty("globalValue", out _), "field report must expose real globalValue");
+Require(entries[0].GetProperty("inEffect").GetBoolean(), "fight field with group active must be in effect");
+var inactive = System.Text.Json.JsonSerializer.SerializeToElement(
+    PathingPreparationTools.EffectiveFieldReport(pathingView, globalView, ["AutoFightConfig"], groupFightActive: false));
+Require(!inactive.EnumerateArray().First().GetProperty("inEffect").GetBoolean(),
+    "group fight switch off must mark fight field not in effect (global wins)");
+Require(entries[1].GetProperty("source").GetString() == "groupOverride", "partyName must read as groupOverride (explicit user setting)");
+
+// ---- DescribeEffectiveStrategy: auto vs file forms through real reflection shapes ----
+var typedAutoStrategy = System.Text.Json.JsonSerializer.SerializeToElement(PathingPreparationTools.DescribeEffectiveStrategy(
+    new { Config = new { PathingConfig = new { AutoFightConfig = new { StrategyName = "根据队伍自动选择" } } } }, userRoot));
+Require(typedAutoStrategy.GetProperty("type").GetString() == "auto", "auto strategy must not be treated as missing txt");
+Directory.CreateDirectory(Path.Combine(userRoot, "AutoFight"));
+File.WriteAllText(Path.Combine(userRoot, "AutoFight", "万能战斗策略（萌新推荐）.txt"),
+    "第1行：通用要求\n第41行：万叶/琴聚集拾取时关闭扫描\n");
+var fileStrategy = System.Text.Json.JsonSerializer.SerializeToElement(PathingPreparationTools.DescribeEffectiveStrategy(
+    new { Config = new { PathingConfig = new { AutoFightConfig = new { StrategyName = "万能战斗策略（萌新推荐）" } } } }, userRoot));
+Require(fileStrategy.GetProperty("type").GetString() == "file:txt", "txt strategy type");
+Require(fileStrategy.GetProperty("version").GetString()!.Length == 64, "strategy version is content sha256");
+Require(fileStrategy.GetProperty("requirementsExcerpt").GetString()!.Contains("关闭扫描"), "excerpt carries original requirements");
+
+// ---- plan registry: 实际执行队列取消（display 名单与执行列表分离的真枚举） ----
+// 镜像宿主 StartGroups：foreach 实际执行列表，第一组运行中在组间边界取消。
+var executionQueue = new List<object> { new GroupStub("组A"), new GroupStub("组B") };
+var displayNames = new List<string> { "组A", "组B" }; // 与执行列表不同对象，仅显示
+var planProgress = new object();
+var planCheck = new BgiBridge.Tools.ScriptGroupPlanTools.PlanRegistration
+{
+    Id = "plan-test", Progress = planProgress, ExecutionQueue = executionQueue,
+    DisplayNames = displayNames, GameHandle = 77,
+};
+var secondGroupRuns = 0;
+var closeInvocations = 0;
+var loop = Task.Run(async () =>
+{
+    try
+    {
+        foreach (var group in executionQueue) // List 枚举器带版本：清空后 MoveNext 抛
+        {
+            await Task.Delay(50); // “第一组运行中/组间边界”
+            if (BgiBridge.Tools.ScriptGroupPlanTools.PlanCancelled(planCheck)) break;
+            if (ReferenceEquals(group, executionQueue.Count > 1 ? executionQueue[1] : null)) secondGroupRuns++;
+        }
+    }
+    catch (InvalidOperationException)
+    {
+        // 宿主 catch/finally Reset 同路径：计划结束
+    }
+});
+await Task.Delay(20); // 保证枚举已开始并进入第一组等待
+var runnerShape = new RunnerContextShape { taskProgress = planProgress };
+Require(BgiBridge.Tools.ScriptGroupPlanTools.CancelPlanQueue(planCheck, 77, runnerShape), "cancel must clear the actual execution queue via runner taskProgress identity");
+var otherRunner = new RunnerContextShape { taskProgress = new object() };
+var planTwo = new BgiBridge.Tools.ScriptGroupPlanTools.PlanRegistration
+{
+    Id = "plan-two", Progress = planProgress, ExecutionQueue = new List<object> { new GroupStub("A"), new GroupStub("B") }, GameHandle = 77,
+};
+Require(!BgiBridge.Tools.ScriptGroupPlanTools.CancelPlanQueue(planTwo, 77, otherRunner),
+    "taskProgress reference mismatch must refuse (stale registration cannot clear a newer plan)");
+Require(executionQueue.Count == 0, "execution queue itself must be emptied (not display names)");
+Require(BgiBridge.Tools.ScriptGroupPlanTools.PlanCancelled(planCheck), "cancel marker independent of host ManualStop");
+await loop;
+Require(secondGroupRuns == 0, "second group must not start after queue cancellation");
+// close 判定按取消标记：取消后不调用关游戏回调。
+if (!BgiBridge.Tools.ScriptGroupPlanTools.PlanCancelled(planCheck)) closeInvocations++;
+Require(closeInvocations == 0, "cancelled plan must not invoke closeGame callback");
+// 身份不符（游戏实例已切换）拒绝清队列：
+var otherQueue = new List<object> { new GroupStub("X") };
+var otherPlan = new BgiBridge.Tools.ScriptGroupPlanTools.PlanRegistration
+{
+    Id = "plan-other", Progress = new object(), ExecutionQueue = otherQueue, GameHandle = 99,
+};
+Require(!BgiBridge.Tools.ScriptGroupPlanTools.CancelPlanQueue(otherPlan, 77), "identity mismatch must refuse");
+Require(otherQueue.Count == 1, "foreign plan queue must stay untouched");
+Require(!BgiBridge.Tools.ScriptGroupPlanTools.PlanCancelled(otherPlan), "foreign plan must not be marked cancelled");
+
+// ---- PlanQueue 防过期：句柄 0 拒绝（不 fail-open） ----
+var stalePlan = new BgiBridge.Tools.ScriptGroupPlanTools.PlanRegistration
+{
+    Id = "plan-stale", Progress = new object(),
+    ExecutionQueue = new List<object> { new GroupStub("A") }, GameHandle = 0,
+};
+Require(!BgiBridge.Tools.ScriptGroupPlanTools.CancelPlanQueue(stalePlan, 0),
+    "handle 0 must refuse (cannot verify identity, never fail-open)");
+Require(!BgiBridge.Tools.ScriptGroupPlanTools.CancelPlanQueue(stalePlan, 55),
+    "plan handle 0 must refuse against any current handle");
+Require(((List<object>)stalePlan.ExecutionQueue).Count == 1 && !BgiBridge.Tools.ScriptGroupPlanTools.PlanCancelled(stalePlan),
+    "refused plan keeps queue and marker untouched");
+
+// ---- 类型默认遮盖识别与对齐决策（生产核心，纯函数） ----
+var nativeDefault = JsonNode.Parse("""
+{"StrategyName":"根据队伍自动选择","PickDropsAfterFightEnabled":true,"KazuhaPickupEnabled":true,"Timeout":120}
+""")!.AsObject();
+var globalMature = JsonNode.Parse("""
+{"StrategyName":"万能战斗策略（萌新推荐）","PickDropsAfterFightEnabled":false,"KazuhaPickupEnabled":true,"Timeout":60}
+""")!.AsObject();
+// 默认遮盖（enabled=true 的旧组同样命中）：组=camel 键的默认等值 → 对齐。
+var defaultShadow = JsonNode.Parse("""
+{"strategyName":"根据队伍自动选择","pickDropsAfterFightEnabled":true,"kazuhaPickupEnabled":true,"timeout":120}
+""")!.AsObject();
+var decision = BgiBridge.Tools.PathingPreparationTools.FightAlignmentDecision(defaultShadow, globalMature, nativeDefault);
+Require(decision.Align, $"type-default shadow must align: {decision.Reason}");
+// 显式自定义：值不同 → 保持。
+var custom = JsonNode.Parse("""
+{"strategyName":"火芙万白","pickDropsAfterFightEnabled":true,"kazuhaPickupEnabled":true,"timeout":120}
+""")!.AsObject();
+decision = BgiBridge.Tools.PathingPreparationTools.FightAlignmentDecision(custom, globalMature, nativeDefault);
+Require(!decision.Align, "explicit custom must stay untouched");
+// 未知额外字段：非默认 → 保持（不丢字段）。
+var withExtra = JsonNode.Parse("""
+{"strategyName":"根据队伍自动选择","pickDropsAfterFightEnabled":true,"kazuhaPickupEnabled":true,"timeout":120,"myCustomExtra":7}
+""")!.AsObject();
+decision = BgiBridge.Tools.PathingPreparationTools.FightAlignmentDecision(withExtra, globalMature, nativeDefault);
+Require(!decision.Align, "unknown extra field means customized; never align/drop");
+// 与全局等值 → 无需对齐。
+decision = BgiBridge.Tools.PathingPreparationTools.FightAlignmentDecision(globalMature.DeepClone().AsObject(), globalMature, nativeDefault);
+Require(!decision.Align, "already equal needs no alignment");
+// 空战斗配置（未写）算默认。
+decision = BgiBridge.Tools.PathingPreparationTools.FightAlignmentDecision(null, globalMature, nativeDefault);
+Require(decision.Align, "absent fight config counts as unconfigured default");
+
+// 对齐后目标等值：经 SyncCore 的 CAS 通道写入 global 克隆并核验（与 SetParty 同一文件机制）。
+File.WriteAllText(groupFile, """
+{"name":"讨伐组","config":{"pathingConfig":{"enabled":true,"partyName":"旧队","autoFightConfig":{"strategyName":"根据队伍自动选择","pickDropsAfterFightEnabled":true,"kazuhaPickupEnabled":true,"timeout":120}}},"projects":[]}
+""");
+var alignSha = Sha();
+var alignedSync = System.Text.Json.JsonSerializer.SerializeToElement(
+    BgiBridge.Tools.PathingPreparationTools.SyncCore(userRoot, "讨伐组", alignSha,
+        new Dictionary<string, JsonNode?> { ["AutoFightConfig"] = globalMature.DeepClone() }));
+Require(alignedSync.GetProperty("verified").GetBoolean() && alignedSync.GetProperty("replacedFieldsVerified").GetBoolean(),
+    "aligned write must read back equal to replacement with precise diff");
+var afterAlign = JsonNode.Parse(File.ReadAllText(groupFile))!;
+var alignedFight = BgiBridge.Tools.PathingPreparationTools.LookupKey(
+    afterAlign["config"]!["pathingConfig"]!.AsObject(), "autoFightConfig") as JsonObject;
+Require((BgiBridge.Tools.PathingPreparationTools.LookupKey(alignedFight!, "pickDropsAfterFightEnabled") as JsonValue)!.GetValue<bool>() is false,
+    "global scan=false must take effect after alignment (case-normalized read)");
+Require(afterAlign["config"]!["pathingConfig"]!["partyName"]!.GetValue<string>() == "旧队",
+    "non-target fields (partyName) preserved by alignment channel");
+
+// Runtime-only SDK arguments are resolved inside a bounded plan, not persisted handles.
+var commandPlan = JsonSerializer.SerializeToElement(new { steps = new object[] {
+    new {command="cmd.sample.open",title="打开数据上下文"},
+    new {command="cmd.sample.refresh",title="等待数据刷新"},
+    new {command="cmd.sample.use",title="使用最新对象",resolveArgument=new {collection="Items",fromStep=1,filters=new object[]{
+        new {property="Title",op="contains",value="直播"},new {property="Codes",op="notEmpty"},new {property="PublishedOn",op="todayOrLater"}},orderBy="PublishedOn",descending=true}}
+} });
+var commandHost = new CommandPlanHostStub();
+var nativePlanRegistry=new MethodRegistry();
+CommandPlanTools.Register(nativePlanRegistry);
+Require(nativePlanRegistry.TryGet("bgi.validate_command_plan",out var planValidationDescriptor,out _) && planValidationDescriptor.ReadOnly && !planValidationDescriptor.RequiresGameReady,"plan validation is discoverable and read-only");
+Require(nativePlanRegistry.TryGet("bgi.run_host_command_plan",out var hostPlanDescriptor,out _) && !hostPlanDescriptor.RequiresGameReady && hostPlanDescriptor.Effect=="hostCommand","host plan does not start a game for UI/data preparation");
+Require(nativePlanRegistry.TryGet("bgi.run_game_command_plan",out var gamePlanDescriptor,out _) && gamePlanDescriptor.RequiresGameReady && gamePlanDescriptor.Preparation=="ensureGameReady","game plan uses the ordinary readiness gate");
+Require(gamePlanDescriptor.OwnsHostCancellation,"plan cancellation is command-scoped and does not issue a global stop while reading data");
+var commandContracts = CommandPlan.Validate(commandPlan,true,commandHost);
+Require(commandHost.Calls.Count==0,"plan validation does not construct windows or execute commands");
+var commandResult=JsonSerializer.SerializeToElement(await CommandPlan.Run(commandPlan,true,commandHost,CancellationToken.None));
+Require(commandHost.Calls.SequenceEqual(new[]{"sample.open","sample.refresh","sample.use"}),"fixed commands execute in order");
+Require(commandHost.RefreshedBeforeUse && ReferenceEquals(commandHost.Used,commandHost.Created!.Items[0]),"async refresh finishes and current Job object is selected");
+Require(commandResult.GetProperty("verification").GetProperty("status").GetString()=="unknown","handler completion cannot claim business success");
+var competingHost=new CommandPlanHostStub{ForeignDuringAwait=true};
+await CommandPlan.Run(commandPlan,true,competingHost,CancellationToken.None);
+Require(ReferenceEquals(competingHost.Used,competingHost.Created!.Items[0]),"another window created during async refresh is not adopted as plan-owned context");
+var fetchPlan=JsonSerializer.SerializeToElement(new{steps=new object[]{new{command="cmd.sample.open",title="打开"},new{command="cmd.sample.refresh",title="只获取",observe=new{collection="Items",fromStep=1,filters=new object[]{new{property="Codes",op="notEmpty"}},orderBy="PublishedOn",descending=true}}}});
+var fetchHost=new CommandPlanHostStub();
+var fetchResult=JsonSerializer.SerializeToElement(await CommandPlan.Run(fetchPlan,false,fetchHost,CancellationToken.None));
+Require(fetchResult.GetProperty("verification").GetProperty("status").GetString()=="succeeded"&&fetchResult.GetProperty("verification").GetProperty("scope").GetString()=="runtimeData","host-only fetch can verify this-run data without claiming redemption");
+Require(!fetchHost.Calls.Contains("sample.use"),"fetch-only intent never adds a game action");
+var hostModeRejected=false;
+try { CommandPlan.Validate(commandPlan,false,new CommandPlanHostStub()); } catch(BridgeException){hostModeRejected=true;}
+Require(hostModeRejected,"game action cannot enter host-only plan");
+var staleHost=new CommandPlanHostStub{Fresh=false};
+var staleRejected=false;
+try { await CommandPlan.Run(commandPlan,true,staleHost,CancellationToken.None); } catch(BridgeException){staleRejected=true;}
+Require(staleRejected && !staleHost.Calls.Contains("sample.use"),"expired own data cannot fall back to a fresh object from another window");
+var swallowedRefresh=new CommandPlanHostStub{RefreshNoOp=true};
+var unchangedRejected=false;
+try{await CommandPlan.Run(commandPlan,true,swallowedRefresh,CancellationToken.None);}catch(BridgeException){unchangedRejected=true;}
+Require(unchangedRejected&&!swallowedRefresh.Calls.Contains("sample.use"),"a swallowed refresh failure cannot reuse an unchanged current-day item");
+var cancelledHost=new CommandPlanHostStub();
+using(var cancellation=new CancellationTokenSource()) {
+    cancellation.CancelAfter(10);
+    var cancelled=false;
+    try {await CommandPlan.Run(commandPlan,true,cancelledHost,cancellation.Token);} catch(OperationCanceledException){cancelled=true;}
+    Require(cancelled && !cancelledHost.Calls.Contains("sample.use"),"cancellation stops the following command");
+}
+var uncancellableHost=new CommandPlanHostStub{IgnoreCancellation=true};
+using(var cancellation=new CancellationTokenSource()) {
+    var running=CommandPlan.Run(commandPlan,true,uncancellableHost,cancellation.Token);
+    cancellation.Cancel();
+    Require(!running.IsCompleted,"cancel request cannot pretend an uncooperative native handler has ended");
+    try{await running;}catch(OperationCanceledException){}
+    Require(!uncancellableHost.Calls.Contains("sample.use"),"uncancellable handler completion still stops the following action");
+}
+var frozenPlan=JsonNode.Parse(commandPlan.GetRawText())!;
+frozenPlan["expectedContractHash"]=CommandPlan.ContractHash(commandContracts);
+var changedHost=new CommandPlanHostStub{Revision="changed"};
+var contractRejected=false;
+try {CommandPlan.Validate(JsonSerializer.SerializeToElement(frozenPlan),true,changedHost);}catch(BridgeException error){contractRejected=error.Code=="PLAN_CONTRACT_CHANGED";}
+Require(contractRejected && changedHost.Calls.Count==0,"changed native command contracts are rejected before effects");
+var selector=commandPlan.GetProperty("steps")[2].GetProperty("resolveArgument");
+var duplicate=new PlanItemStub();
+var ambiguous=false;
+try {CommandPlan.Select(new[]{duplicate,new PlanItemStub()},typeof(PlanItemStub),selector,DateTime.Now);}catch(BridgeException error){ambiguous=error.Code=="AMBIGUOUS_TARGET";}
+Require(ambiguous,"ordering ties never guess an SDK object");
+var oversized=false;
+try {CommandPlan.Select(Enumerable.Range(0,513).Select(_=>new PlanItemStub()),typeof(PlanItemStub),selector,DateTime.Now);}catch(BridgeException){oversized=true;}
+Require(oversized,"runtime object scan is bounded");
+var datedSelector=JsonSerializer.SerializeToElement(new{collection="Items",filters=new object[]{new{property="PublishedOn",op="notAfterNow"},new{property="ValidUntil",op="notBeforeNow"},new{property="Codes",op="notEmpty"}},orderBy="PublishedOn",descending=true});
+var expired=new PlanItemStub{PublishedOn=DateTime.Today.AddDays(-2).ToString("yyyy-MM-dd"),ValidUntil=DateTime.Today.AddDays(-1).ToString("yyyy-MM-dd")};
+var unpublished=new PlanItemStub{PublishedOn=DateTime.Today.AddDays(1).ToString("yyyy-MM-dd")};
+var validCurrent=new PlanItemStub();
+Require(ReferenceEquals(CommandPlan.Select(new[]{expired,unpublished,validCurrent},typeof(PlanItemStub),datedSelector,DateTime.Now),validCurrent),"unpublished and expired items cannot become current data");
+var unknownExpiry=new PlanItemStub{ValidUntil=""};
+var attemptSelector=JsonSerializer.SerializeToElement(new{collection="Items",filters=new object[]{new{property="ValidUntil",op="notBeforeNowOrUnknown"}}});
+Require(ReferenceEquals(CommandPlan.Select(new[]{expired,unknownExpiry},typeof(PlanItemStub),attemptSelector,DateTime.Now),unknownExpiry),"known expired is skipped while user-authorized unknown validity can be attempted");
+var successReceipt=NativeCommandEvidence.Classify(new[]{"CODE-A","CODE-B"},new[]{
+    new HostLogTools.HostLogEntry(TimeSpan.Zero,"INF","Primary:S4:P123:T1","BetterGenshinImpact.GameTask.UseRedeemCode.UseRedemptionCodeTask","兑换码 CODE-A 兑换成功"),
+    new HostLogTools.HostLogEntry(TimeSpan.Zero,"INF","Primary:S4:P123:T1","BetterGenshinImpact.GameTask.UseRedeemCode.UseRedemptionCodeTask","兑换码 CODE-B 兑换成功")},123);
+Require(successReceipt.GetProperty("status").GetString()=="succeeded","actual per-code native log receipt can verify success");
+var incompleteReceipt=NativeCommandEvidence.Classify(new[]{"CODE-A","CODE-B"},new[]{new HostLogTools.HostLogEntry(TimeSpan.Zero,"INF","Primary:S4:P999:T1","UseRedemptionCodeTask","兑换码 CODE-A 兑换成功")},123);
+Require(incompleteReceipt.GetProperty("status").GetString()=="unknown","another process or incomplete receipts cannot become success");
+var failureReceipt=NativeCommandEvidence.Classify(new[]{"CODE-A"},new[]{new HostLogTools.HostLogEntry(TimeSpan.Zero,"WRN","Primary:S4:P123:T1","UseRedemptionCodeTask","兑换码 CODE-A 兑换失败，可能是过期、错误或已被使用")},123);
+Require(failureReceipt.GetProperty("status").GetString()=="failed","real failure is retained without guessing expired versus already-used");
+var hostSourceRoot=Environment.GetEnvironmentVariable("PUDDING_BGI_HOST_SOURCE_ROOT");
+if(!string.IsNullOrWhiteSpace(hostSourceRoot)) {
+    var source=File.ReadAllText(Path.Combine(hostSourceRoot,"BetterGenshinImpact/ViewModel/Windows/FeedWindowViewModel.cs"));
+    foreach(var fragment in new[]{"ObservableCollection<FeedItem> _cnFeedItems","private async Task GetLiveRedeemCodes()","private async Task AutoRedeemItem(FeedItem item)","private string _time","private string _valid","private List<string> _codes","Time = DateTime.Now.ToString"})
+        Require(source.Contains(fragment,StringComparison.Ordinal),"real host source contract mapping: "+fragment);
+    var main=File.ReadAllText(Path.Combine(hostSourceRoot,"BetterGenshinImpact/ViewModel/MainWindowViewModel.cs"));
+    Require(main.Contains("OpenFeed",StringComparison.Ordinal),"real host OpenFeed command exists");
+    var redeem=File.ReadAllText(Path.Combine(hostSourceRoot,"BetterGenshinImpact/GameTask/UseRedeemCode/UseRedemptionCodeTask.cs"));
+    Require(redeem.Contains("兑换码 {Code} 兑换成功",StringComparison.Ordinal)&&redeem.Contains("兑换码 {Code} 兑换失败",StringComparison.Ordinal),"receipt mapping comes from the real host's per-code log statements");
+    Console.WriteLine("real host source mapping checked: OpenFeed / GetLiveRedeemCodes / AutoRedeemItem, CnFeedItems, Title, Time, Codes, Valid; fetched Time is not publication evidence");
+}
+foreach(var forbidden in new[]{"sample.delete","sample.dialog","sample.internal"}) {
+    var body=JsonSerializer.SerializeToElement(new{steps=new[]{new{command="cmd."+forbidden,title="禁止动作"}}});
+    var denied=false;var host=new CommandPlanHostStub();
+    try{CommandPlan.Validate(body,true,host);}catch(BridgeException){denied=true;}
+    Require(denied && host.Calls.Count==0,"plan cannot elevate unsafe command: "+forbidden);
+}
+Console.WriteLine("command-plan checks passed: validation-only, runtime SDK objects, async order, stale isolation, ambiguity, bounds, cancellation, contract pin, no false completion");
+Console.WriteLine("production-core checks passed");
+
+// ---- 真实宿主形态替身（成员在文件底部） ----
+
+internal sealed class RunnerContextShape
+{
+    public object? taskProgress { get; set; }
+}
+
+internal sealed class GroupStub(string name)
+{
+    public string Name { get; } = name;
+}
+
+internal sealed class PlanItemStub
+{
+    public string Title {get;set;}="直播兑换码";
+    public string PublishedOn {get;set;}=DateTime.Today.ToString("yyyy-MM-dd");
+    public string ValidUntil {get;set;}=DateTime.Today.ToString("yyyy-MM-dd");
+    public List<string> Codes {get;set;}=["CURRENT-CODE"];
+}
+internal sealed class PlanOwnerStub { public List<PlanItemStub> Items {get;set;}=[]; }
+internal sealed class PlanRootStub { }
+internal sealed class CommandPlanHostStub:ICommandPlanHost
+{
+    public bool Fresh {get;set;}=true;
+    public bool RefreshNoOp {get;set;}
+    public bool IgnoreCancellation {get;set;}
+    public bool ForeignDuringAwait {get;set;}
+    public string Revision {get;set;}="initial";
+    public List<string> Calls {get;}=[];
+    private readonly PlanRootStub root=new();
+    private readonly PlanOwnerStub foreign=new(){Items=[new PlanItemStub()]};
+    public PlanOwnerStub? Created {get;private set;}
+    public object? Used {get;private set;}
+    public bool RefreshedBeforeUse {get;private set;}
+    private bool refreshed;
+    private IReadOnlyList<object> created=[];
+    private PlanOwnerStub? competing;
+    public IReadOnlyList<object> TakeCreated(){var values=created;created=[];return values;}
+    public CommandPlanContract Describe(string name)=>new(name,name=="sample.open"?typeof(PlanRootStub):typeof(PlanOwnerStub),name=="sample.use"?typeof(PlanItemStub):null,name=="sample.use",name=="sample.delete",name=="sample.dialog",name=="sample.internal",null,Revision);
+    public object Owner(CommandPlanContract contract,IReadOnlyList<object> created)=>contract.Owner==typeof(PlanRootStub)?root:created.OfType<PlanOwnerStub>().Single();
+    public IReadOnlyList<object> Snapshot(object? source=null)=>new object[]{root,foreign}.Concat(foreign.Items).Concat(Created is null?[]:new object[]{Created}.Concat(Created.Items)).Concat(competing is null?[]:new object[]{competing}).ToArray();
+    public async Task<JsonElement?> Invoke(CommandPlanContract contract,object owner,object? argument,CancellationToken cancellation)
+    {
+        Calls.Add(contract.Name);
+        if(contract.Name=="sample.open"){Created=new(){Items=[new PlanItemStub()]};created=[Created];}
+        if(contract.Name=="sample.refresh") {
+            await Task.Delay(25,IgnoreCancellation?CancellationToken.None:cancellation);
+            if(ForeignDuringAwait)competing=new(){Items=[new PlanItemStub()]};
+            if(!RefreshNoOp)Created!.Items=[new PlanItemStub{PublishedOn=(Fresh?DateTime.Today:DateTime.Today.AddDays(-30)).ToString("yyyy-MM-dd")}];
+            refreshed=true;
+        }
+        if(contract.Name=="sample.use") {RefreshedBeforeUse=refreshed;Used=argument;}
+        return null;
+    }
+}
+
+
+// SwitchPartyTask 真实形态：Name 只读 getter；唯一 Start(string, CancellationToken)。
+
+
+
+// CombatScenes 真实形态：Avatars 私有字段；公共 GetAvatars()。

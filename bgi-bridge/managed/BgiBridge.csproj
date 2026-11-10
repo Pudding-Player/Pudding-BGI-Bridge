@@ -1,0 +1,53 @@
+<Project>
+  <!-- 中间产物收到仓库的 target/dotnet/ 下，源码目录里不留 obj/ 和 bin/ —— 另三个项目也一样，
+       build.cmd 的 -o 指向同一处。
+       必须在 Sdk.props 之前设置，所以要写成显式 Import 而不是 Project Sdk="..."。 -->
+  <PropertyGroup>
+    <BaseIntermediateOutputPath>../../target/dotnet/managed-obj/</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>../../target/dotnet/managed-obj/</MSBuildProjectExtensionsPath>
+  </PropertyGroup>
+  <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
+
+  <PropertyGroup>
+    <!-- 目标框架必须与宿主 BetterGI 一致：它是 net8.0-windows + WindowsDesktop 框架依赖单文件。
+         目标框架不一致会让 hostfxr 认为"运行时属性不同"，拿不到已初始化的运行时上下文。 -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>BgiBridge</AssemblyName>
+    <RootNamespace>BgiBridge</RootNamespace>
+    <OutputPath>../../target/dotnet/managed/</OutputPath>
+
+    <!-- 零第三方依赖：宿主是框架依赖应用，嵌入的 deps.json 不可编辑，
+         依赖加不进它的依赖图，只用 TPA 里已有的 BCL。 -->
+    <EnableDefaultItems>true</EnableDefaultItems>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DebugType>none</DebugType>
+
+    <!-- 产物是能被 load_assembly_and_get_function_pointer 加载的普通程序集，
+         不生成 apphost，也不参与单文件打包。 -->
+    <UseAppHost>false</UseAppHost>
+    <SelfContained>false</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+
+    <!-- 类库默认不生成 runtimeconfig.json，原生引导 DLL 靠它调
+         hostfxr_initialize_for_runtime_config 接上进程里已有的运行时。 -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="generated/host-documentation.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- dev/ 静态验收直接测内部状态机与合并逻辑。 -->
+    <InternalsVisibleTo Include="ReadinessPartyChecks" />
+    <InternalsVisibleTo Include="ProductionCoreChecks" />
+  </ItemGroup>
+
+  <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+</Project>
